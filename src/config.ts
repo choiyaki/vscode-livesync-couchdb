@@ -24,15 +24,14 @@ export function getConfig(): LiveSyncConfig {
   };
 }
 
+export function isConfigured(config: LiveSyncConfig): boolean {
+  return Boolean(config.url && config.database && config.username);
+}
+
 export async function setConfigValue<T>(key: string, value: T): Promise<void> {
   await vscode.workspace.getConfiguration(SECTION).update(key, value, vscode.ConfigurationTarget.Workspace);
 }
 
 export async function ensureConfigured(config: LiveSyncConfig): Promise<boolean> {
-  if (config.url && config.database && config.username) {
-    return true;
-  }
-
-  vscode.window.showWarningMessage("LiveSync CouchDB is not configured. Run 'LiveSync: Configure CouchDB'.");
-  return false;
+  return isConfigured(config);
 }

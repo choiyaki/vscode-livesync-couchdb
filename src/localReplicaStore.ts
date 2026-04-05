@@ -69,7 +69,6 @@ export class LocalReplicaStore {
     const existing = this.documents.get(path);
     const next: LocalReplicaDocument = {
       path,
-      content: "",
       contentHash: "",
       localMtime: existing?.localMtime ?? 0,
       remoteRev,

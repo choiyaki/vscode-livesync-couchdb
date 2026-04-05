@@ -68,7 +68,6 @@ export interface WorkspaceFile {
 
 export interface LocalReplicaDocument {
   path: string;
-  content: string;
   contentHash: string;
   localMtime: number;
   remoteRev?: string;

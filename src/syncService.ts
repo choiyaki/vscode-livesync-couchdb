@@ -24,10 +24,9 @@ export class SyncService {
     const result = emptyResult();
     let mismatchLogCount = 0;
     const uris = await listWorkspaceFiles(this.config);
-    const files = await Promise.all(uris.map((uri) => readWorkspaceFile(uri)));
     const localPathSet = new Set<string>();
-    for (const file of files) {
-      localPathSet.add(file.relativePath);
+    for (const uri of uris) {
+      localPathSet.add(getRelativePath(uri));
     }
     for (const trackedPath of this.localReplica.listPaths()) {
       const tracked = this.localReplica.get(trackedPath);
@@ -42,7 +41,16 @@ export class SyncService {
         this.logger.info(`Pushed tombstone for deleted file: ${trackedPath}`);
       }
     }
-    for (const file of files) {
+    for (const uri of uris) {
+      const relativePath = getRelativePath(uri);
+      const trackedReplica = this.localReplica.get(relativePath);
+      const stat = await vscode.workspace.fs.stat(uri);
+      if (trackedReplica && !trackedReplica.deleted && trackedReplica.localMtime === stat.mtime) {
+        result.skipped += 1;
+        continue;
+      }
+
+      const file = await readWorkspaceFile(uri);
       const replica = this.localReplica.get(file.relativePath);
       if (replica && !replica.deleted && replica.contentHash === file.contentHash) {
         result.skipped += 1;
@@ -54,7 +62,7 @@ export class SyncService {
         const remoteContent = await this.client.assembleContent(remote);
         const remoteHash = hashText(remoteContent);
         if (remoteHash === file.contentHash) {
-          await this.localReplica.upsert(this.toReplicaEntry(file.relativePath, file.content, file.contentHash, file.mtime, remote._rev, remote.mtime, false));
+          await this.localReplica.upsert(this.toReplicaEntry(file.relativePath, file.contentHash, file.mtime, remote._rev, remote.mtime, false));
           await this.metadata.clearConflict(file.relativePath);
           result.skipped += 1;
           continue;
@@ -77,7 +85,7 @@ export class SyncService {
         _id: file.relativePath, type: "plain", path: file.relativePath,
         data: file.content, mtime: file.mtime, deleted: false
       }, remote?._rev);
-      await this.localReplica.upsert(this.toReplicaEntry(file.relativePath, file.content, file.contentHash, file.mtime, response.rev, file.mtime, false));
+      await this.localReplica.upsert(this.toReplicaEntry(file.relativePath, file.contentHash, file.mtime, response.rev, file.mtime, false));
       await this.metadata.clearConflict(file.relativePath);
       result.pushed += 1;
     }
@@ -147,6 +155,13 @@ export class SyncService {
   async pushSingle(uri: vscode.Uri): Promise<SyncResult> {
     const result = emptyResult();
     const relativePath = getRelativePath(uri);
+    const stat = await vscode.workspace.fs.stat(uri);
+    const trackedReplica = this.localReplica.get(relativePath);
+    if (trackedReplica && !trackedReplica.deleted && trackedReplica.localMtime === stat.mtime) {
+      result.skipped = 1;
+      return result;
+    }
+
     const file = await readWorkspaceFile(uri);
     const replica = this.localReplica.get(relativePath);
     if (replica && !replica.deleted && replica.contentHash === file.contentHash) {
@@ -159,7 +174,7 @@ export class SyncService {
       const remoteContent = await this.client.assembleContent(remote);
       const remoteHash = hashText(remoteContent);
       if (remoteHash === file.contentHash) {
-        await this.localReplica.upsert(this.toReplicaEntry(relativePath, file.content, file.contentHash, file.mtime, remote._rev, remote.mtime, false));
+        await this.localReplica.upsert(this.toReplicaEntry(relativePath, file.contentHash, file.mtime, remote._rev, remote.mtime, false));
         await this.metadata.clearConflict(relativePath);
         result.skipped = 1;
         return result;
@@ -175,7 +190,7 @@ export class SyncService {
       _id: relativePath, type: "plain", path: relativePath,
       data: file.content, mtime: file.mtime, deleted: false
     }, remote?._rev);
-    await this.localReplica.upsert(this.toReplicaEntry(relativePath, file.content, file.contentHash, file.mtime, response.rev, file.mtime, false));
+    await this.localReplica.upsert(this.toReplicaEntry(relativePath, file.contentHash, file.mtime, response.rev, file.mtime, false));
     await this.metadata.clearConflict(relativePath);
     result.pushed = 1;
     return result;
@@ -251,7 +266,7 @@ export class SyncService {
         }, latest?._rev);
       }
       await this.metadata.clearConflict(relativePath);
-      await this.localReplica.upsert(this.toReplicaEntry(relativePath, file.content, hashText(file.content), file.mtime, response.rev, file.mtime, false));
+      await this.localReplica.upsert(this.toReplicaEntry(relativePath, hashText(file.content), file.mtime, response.rev, file.mtime, false));
       this.logger.info(`Conflict resolved (accept local): ${relativePath}`);
     } else {
       const remote = await this.client.getDocument(relativePath);
@@ -261,7 +276,7 @@ export class SyncService {
       const stat = uri ? await vscode.workspace.fs.stat(uri) : undefined;
       const remoteContent = await this.client.assembleContent(remote);
       await this.metadata.clearConflict(relativePath);
-      await this.localReplica.upsert(this.toReplicaEntry(relativePath, remoteContent, hashText(remoteContent), stat?.mtime ?? Date.now(), remote._rev, remote.mtime, false));
+      await this.localReplica.upsert(this.toReplicaEntry(relativePath, hashText(remoteContent), stat?.mtime ?? Date.now(), remote._rev, remote.mtime, false));
       this.logger.info(`Conflict resolved (accept remote): ${relativePath}`);
     }
     void tracked;
@@ -296,7 +311,7 @@ export class SyncService {
       const docHash = hashText(remoteContent);
       const existing = await this.readLocalIfExists(target);
       if (existing && existing.contentHash === docHash) {
-        await this.localReplica.upsert(this.toReplicaEntry(doc.path, remoteContent, docHash, existing.mtime, doc._rev, doc.mtime, false));
+        await this.localReplica.upsert(this.toReplicaEntry(doc.path, docHash, existing.mtime, doc._rev, doc.mtime, false));
         await this.metadata.clearConflict(doc.path);
         result.skipped += 1;
         continue;
@@ -309,14 +324,14 @@ export class SyncService {
       }
       await this.writeToLocal(doc.path, remoteContent);
       const stat = await vscode.workspace.fs.stat(target);
-      await this.localReplica.upsert(this.toReplicaEntry(doc.path, remoteContent, docHash, stat.mtime, doc._rev, doc.mtime, false));
+      await this.localReplica.upsert(this.toReplicaEntry(doc.path, docHash, stat.mtime, doc._rev, doc.mtime, false));
       await this.metadata.clearConflict(doc.path);
       result.pulled += 1;
     }
   }
 
-  private toReplicaEntry(relativePath: string, content: string, contentHash: string, localMtime: number, remoteRev: string | undefined, remoteMtime: number, deleted: boolean) {
-    return { path: relativePath, content, contentHash, localMtime, remoteRev, remoteMtime, deleted, updatedAt: Date.now() };
+  private toReplicaEntry(relativePath: string, contentHash: string, localMtime: number, remoteRev: string | undefined, remoteMtime: number, deleted: boolean) {
+    return { path: relativePath, contentHash, localMtime, remoteRev, remoteMtime, deleted, updatedAt: Date.now() };
   }
 
   private hasRemoteConflict(trackedRemoteRev: string | undefined, remoteRev: string | undefined, localHash: string, remoteHash: string): boolean {

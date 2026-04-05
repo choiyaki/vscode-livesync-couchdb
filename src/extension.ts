@@ -1,5 +1,5 @@
 import * as vscode from "vscode";
-import { ensureConfigured, getConfig, setConfigValue } from "./config";
+import { ensureConfigured, getConfig, isConfigured, setConfigValue } from "./config";
 import { CouchDbClient } from "./couchdb";
 import { LocalReplicaStore } from "./localReplicaStore";
 import { LiveSyncLogger } from "./log";
@@ -20,6 +20,7 @@ export function activate(context: vscode.ExtensionContext): void {
   const statusBar = new LiveSyncStatusBar();
   const metadata = new MetadataStore(context.storageUri);
   const localReplica = new LocalReplicaStore(context.storageUri);
+  let setupHintShown = false;
 
   const saveDirtyDocuments = async (): Promise<boolean> => {
     const dirtyDocuments = vscode.workspace.textDocuments.filter(
@@ -46,17 +47,57 @@ export function activate(context: vscode.ExtensionContext): void {
     { dispose: () => statusBar.dispose() }
   );
 
+  const showSetupHintOnce = (missing: "settings" | "password"): void => {
+    if (setupHintShown) {
+      return;
+    }
+
+    setupHintShown = true;
+    const message = missing === "settings"
+      ? "LiveSync CouchDB is idle until connection settings are configured."
+      : "LiveSync CouchDB is idle until the CouchDB password is configured.";
+
+    void vscode.window.showInformationMessage(message, "Configure CouchDB").then((selection) => {
+      if (selection === "Configure CouchDB") {
+        void vscode.commands.executeCommand("livesync.configure");
+      }
+    });
+  };
+
+  const hasConnectionSettings = async (showHint = false): Promise<boolean> => {
+    const config = getConfig();
+    if (!isConfigured(config)) {
+      if (showHint) {
+        showSetupHintOnce("settings");
+      }
+      return false;
+    }
+
+    const password = await getPassword(context);
+    if (!password) {
+      if (showHint) {
+        showSetupHintOnce("password");
+      }
+      return false;
+    }
+
+    return true;
+  };
+
   const runWithClient = async <T>(label: string, callback: (service: SyncService) => Promise<T>): Promise<T | undefined> => {
     await metadata.initialize();
     await localReplica.initialize();
     const config = getConfig();
     if (!(await ensureConfigured(config))) {
+      logger.info(`Skipped ${label}: CouchDB is not configured.`);
+      showSetupHintOnce("settings");
       return undefined;
     }
 
     const password = await getPassword(context);
     if (!password) {
-      vscode.window.showWarningMessage("LiveSync CouchDB password is not set. Run 'LiveSync: Configure CouchDB'.");
+      logger.info(`Skipped ${label}: CouchDB password is not configured.`);
+      showSetupHintOnce("password");
       return undefined;
     }
 
@@ -319,6 +360,10 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
+    if (!(await hasConnectionSettings(true))) {
+      return;
+    }
+
     scheduleSavePush(document.uri);
   });
 
@@ -328,6 +373,11 @@ export function activate(context: vscode.ExtensionContext): void {
     if (!matchesFileConfig(relativePath, config)) {
       return;
     }
+
+    if (!(await hasConnectionSettings(true))) {
+      return;
+    }
+
     await enqueueSyncOperation(async () => {
       await runWithClient("delete-sync", async (service) => {
         const deleted = await service.pushDeletion(relativePath);
@@ -342,7 +392,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   // ── Startup sync ──────────────────────────────────────────
   const startupConfig = getConfig();
-  if (startupConfig.syncOnStartup) {
+  if (startupConfig.syncOnStartup && isConfigured(startupConfig)) {
     setImmediate(() => {
       runningSync = enqueueSyncOperation(async () => {
         await runWithClient("startup-sync", async (service) => {
@@ -362,6 +412,8 @@ export function activate(context: vscode.ExtensionContext): void {
           runningSync = undefined;
         });
     });
+  } else if (startupConfig.syncOnStartup) {
+    logger.info("Startup sync is enabled but CouchDB is not configured; skipping startup sync.");
   }
 
   // ── Auto-pull timer ───────────────────────────────────────
@@ -372,21 +424,27 @@ export function activate(context: vscode.ExtensionContext): void {
         return;
       }
 
-      runningAutoPull = enqueueSyncOperation(async () => {
-        await runWithClient("auto-pull", async (service) => {
-          const result = await service.pullIncremental();
-          if (result.pulled > 0 || result.conflicts.length > 0) {
-            logger.info(`Auto-pull: pulled=${result.pulled}, conflicts=${result.conflicts.length}`);
-          }
-        });
-      })
-        .then(() => undefined)
-        .catch((err: unknown) => {
-          logger.error("Auto-pull failed", err);
+      void hasConnectionSettings().then((ready) => {
+        if (!ready) {
+          return;
+        }
+
+        runningAutoPull = enqueueSyncOperation(async () => {
+          await runWithClient("auto-pull", async (service) => {
+            const result = await service.pullIncremental();
+            if (result.pulled > 0 || result.conflicts.length > 0) {
+              logger.info(`Auto-pull: pulled=${result.pulled}, conflicts=${result.conflicts.length}`);
+            }
+          });
         })
-        .finally(() => {
-          runningAutoPull = undefined;
-        });
+          .then(() => undefined)
+          .catch((err: unknown) => {
+            logger.error("Auto-pull failed", err);
+          })
+          .finally(() => {
+            runningAutoPull = undefined;
+          });
+      });
     }, intervalSec * 1000);
 
     context.subscriptions.push({ dispose: () => clearInterval(timer) });

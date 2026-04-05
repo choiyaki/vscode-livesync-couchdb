@@ -112,5 +112,19 @@ Watch:
 npm run watch
 ```
 
+Package a local installable VS Code extension:
+
+```sh
+npm run compile
+npm run package:vsix
+```
+
+This creates a `.vsix` file in the project root.
+
+Notes:
+
+- Packaging with `@vscode/vsce` currently requires Node 20 or later
+- Installing the VSIX in VS Code can be done from `Extensions: Install from VSIX...`
+
 If you open the parent workspace, use the root launch and task configuration.
 If you open only `vscode-livesync-couchdb`, use the subproject launch and task configuration.
