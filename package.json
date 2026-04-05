@@ -1,0 +1,110 @@
+{
+  "name": "vscode-livesync-couchdb",
+  "displayName": "LiveSync CouchDB",
+  "description": "CouchDB-only LiveSync extension for VS Code workspaces.",
+  "version": "0.0.1",
+  "publisher": "local-dev",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.98.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "livesync.configure",
+        "title": "LiveSync: Configure CouchDB"
+      },
+      {
+        "command": "livesync.testConnection",
+        "title": "LiveSync: Test CouchDB Connection"
+      },
+      {
+        "command": "livesync.syncNow",
+        "title": "LiveSync: Sync Now"
+      },
+      {
+        "command": "livesync.pushNow",
+        "title": "LiveSync: Push Now"
+      },
+      {
+        "command": "livesync.pullNow",
+        "title": "LiveSync: Pull Now"
+      },
+      {
+        "command": "livesync.pullFullNow",
+        "title": "LiveSync: Full Pull Now"
+      },
+      {
+        "command": "livesync.showConflicts",
+        "title": "LiveSync: Show Conflicts"
+      },
+      {
+        "command": "livesync.resolveConflict",
+        "title": "LiveSync: Resolve Conflict"
+      }
+    ],
+    "configuration": {
+      "title": "LiveSync CouchDB",
+      "properties": {
+        "livesync.couchdb.url": {
+          "type": "string",
+          "default": "",
+          "description": "Base URL of the CouchDB server, for example https://example.com:6984"
+        },
+        "livesync.couchdb.database": {
+          "type": "string",
+          "default": "",
+          "description": "Database name to sync with"
+        },
+        "livesync.couchdb.username": {
+          "type": "string",
+          "default": "",
+          "description": "CouchDB username"
+        },
+        "livesync.syncOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Push the saved file after VS Code saves it"
+        },
+        "livesync.syncOnStartup": {
+          "type": "boolean",
+          "default": false,
+          "description": "Run a full sync automatically when the extension activates"
+        },
+        "livesync.autoSyncIntervalSeconds": {
+          "type": "number",
+          "default": 0,
+          "minimum": 0,
+          "description": "Pull from CouchDB every N seconds. Set to 0 to disable."
+        },
+        "livesync.include": {
+          "type": "string",
+          "default": "**/*.{md,txt,markdown}",
+          "description": "Glob of files to include during sync"
+        },
+        "livesync.exclude": {
+          "type": "string",
+          "default": "**/.git/**,**/node_modules/**,**/.obsidian/**,**/.vscode/**,**/.DS_Store",
+          "description": "Comma-separated globs to exclude from sync"
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "vscode:prepublish": "npm run compile"
+  },
+  "devDependencies": {
+    "@types/node": "^22.14.1",
+    "@types/vscode": "^1.98.0",
+    "typescript": "^5.8.2"
+  }
+}

@@ -1,0 +1,14 @@
+.DS_Store
+
+# Keep shared launch/tasks, but do not publish personal workspace settings.
+.vscode/settings.json
+
+# Local installs and build artifacts.
+node_modules/
+out/
+
+# Packaging output
+*.vsix
+
+# Local logs
+*.log
