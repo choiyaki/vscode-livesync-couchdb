@@ -15,6 +15,7 @@ function defaultCheckpoint(): LocalReplicaCheckpoint {
 
 export class LocalReplicaStore {
   private readonly documents = new Map<string, LocalReplicaDocument>();
+  private readonly docIdToPath = new Map<string, string>();
   private checkpoint: LocalReplicaCheckpoint = defaultCheckpoint();
   private initialized = false;
 
@@ -35,6 +36,9 @@ export class LocalReplicaStore {
       const parsed = JSON.parse(raw) as Partial<LocalReplicaFileShape>;
       for (const [path, document] of Object.entries(parsed.documents ?? {})) {
         this.documents.set(path, document);
+        if (document.documentId) {
+          this.docIdToPath.set(document.documentId, path);
+        }
       }
       this.checkpoint = parsed.checkpoint ?? defaultCheckpoint();
     } catch {
@@ -46,6 +50,10 @@ export class LocalReplicaStore {
 
   get(path: string): LocalReplicaDocument | undefined {
     return this.documents.get(path);
+  }
+
+  getPathByDocumentId(docId: string): string | undefined {
+    return this.docIdToPath.get(docId);
   }
 
   listPaths(): string[] {
@@ -62,6 +70,9 @@ export class LocalReplicaStore {
 
   async upsert(document: LocalReplicaDocument): Promise<void> {
     this.documents.set(document.path, document);
+    if (document.documentId) {
+      this.docIdToPath.set(document.documentId, document.path);
+    }
     await this.persist();
   }
 
@@ -69,6 +80,7 @@ export class LocalReplicaStore {
     const existing = this.documents.get(path);
     const next: LocalReplicaDocument = {
       path,
+      documentId: existing?.documentId,
       contentHash: "",
       localMtime: existing?.localMtime ?? 0,
       remoteRev,

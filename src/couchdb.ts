@@ -12,11 +12,11 @@ function trimSlash(value: string): string {
 
 function createLeafId(content: string): string {
   const hash = crypto.createHash("sha256").update(content, "utf8").digest("hex");
-  return `f:${hash}`;
+  return `h:${hash}`;
 }
 
 function isLikelyLeafId(id: string): boolean {
-  return /^[a-z]:[0-9a-f]{16,}$/i.test(id);
+  return /^h:[0-9a-z]{8,}$/i.test(id);
 }
 
 export class CouchDbClient {
@@ -145,7 +145,7 @@ export class CouchDbClient {
       _id: document._id,
       type: "plain" as ObsidianDocType,
       datatype: "plain" as ObsidianDocType,
-      path: document._id,
+      path: document.path,
       data: children.length > 0 ? [] : content,
       mtime,
       ctime: document.ctime ?? mtime,
@@ -204,8 +204,8 @@ export class CouchDbClient {
     }
   }
 
-  async tombstoneDocument(path: string, mtime: number): Promise<CouchDbWriteResponse | undefined> {
-    const existing = await this.getDocument(path);
+  async tombstoneDocument(docId: string, originalPath: string, mtime: number): Promise<CouchDbWriteResponse | undefined> {
+    const existing = await this.getDocument(docId);
     if (!existing) {
       return undefined;
     }
@@ -214,7 +214,7 @@ export class CouchDbClient {
       _id: existing._id,
       _rev: existing._rev,
       type: "plain",
-      path,
+      path: originalPath,
       data: "",
       mtime,
       ctime: existing.ctime ?? mtime,

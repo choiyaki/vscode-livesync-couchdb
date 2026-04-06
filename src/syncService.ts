@@ -4,6 +4,7 @@ import { CouchDbClient } from "./couchdb";
 import { LocalReplicaStore } from "./localReplicaStore";
 import { LiveSyncLogger } from "./log";
 import { MetadataStore } from "./metadataStore";
+import { path2id, isObfuscatedId } from "./pathObfuscation";
 import { LiveSyncConfig, RemoteDocument, SyncResult } from "./types";
 import { getRelativePath, hashText, listWorkspaceFiles, matchesFileConfig, readWorkspaceFile } from "./workspaceFiles";
 
@@ -17,8 +18,18 @@ export class SyncService {
     private readonly client: CouchDbClient,
     private readonly logger: LiveSyncLogger,
     private readonly metadata: MetadataStore,
-    private readonly localReplica: LocalReplicaStore
+    private readonly localReplica: LocalReplicaStore,
+    private readonly passphrase: string | undefined
   ) {}
+
+  private docId(relativePath: string): string {
+    return path2id(relativePath, this.passphrase);
+  }
+
+  private resolvePathFromChangeId(changeId: string): string | undefined {
+    if (!isObfuscatedId(changeId)) return changeId;
+    return this.localReplica.getPathByDocumentId(changeId);
+  }
 
   async pushAll(): Promise<SyncResult> {
     const result = emptyResult();
@@ -33,7 +44,8 @@ export class SyncService {
       if (!tracked || tracked.deleted || localPathSet.has(trackedPath)) {
         continue;
       }
-      const response = await this.client.tombstoneDocument(trackedPath, Date.now());
+      const trackedDocId = this.docId(trackedPath);
+      const response = await this.client.tombstoneDocument(trackedDocId, trackedPath, Date.now());
       if (response) {
         await this.localReplica.markDeleted(trackedPath, response.rev, Date.now());
         await this.metadata.clearConflict(trackedPath);
@@ -57,12 +69,12 @@ export class SyncService {
         continue;
       }
 
-      const remote = await this.client.getDocument(file.relativePath);
+      const remote = await this.client.getDocument(this.docId(file.relativePath));
       if (remote && !remote.deleted) {
         const remoteContent = await this.client.assembleContent(remote);
         const remoteHash = hashText(remoteContent);
         if (remoteHash === file.contentHash) {
-          await this.localReplica.upsert(this.toReplicaEntry(file.relativePath, file.contentHash, file.mtime, remote._rev, remote.mtime, false));
+          await this.localReplica.upsert(this.toReplicaEntry(file.relativePath, this.docId(file.relativePath), file.contentHash, file.mtime, remote._rev, remote.mtime, false));
           await this.metadata.clearConflict(file.relativePath);
           result.skipped += 1;
           continue;
@@ -81,11 +93,12 @@ export class SyncService {
           mismatchLogCount += 1;
         }
       }
+      const docId = this.docId(file.relativePath);
       const response = await this.client.upsertDocument({
-        _id: file.relativePath, type: "plain", path: file.relativePath,
+        _id: docId, type: "plain", path: file.relativePath,
         data: file.content, mtime: file.mtime, deleted: false
       }, remote?._rev);
-      await this.localReplica.upsert(this.toReplicaEntry(file.relativePath, file.contentHash, file.mtime, response.rev, file.mtime, false));
+      await this.localReplica.upsert(this.toReplicaEntry(file.relativePath, docId, file.contentHash, file.mtime, response.rev, file.mtime, false));
       await this.metadata.clearConflict(file.relativePath);
       result.pushed += 1;
     }
@@ -112,13 +125,18 @@ export class SyncService {
     const changedIds = new Set<string>();
 
     for (const change of changes.changes) {
-      const replica = this.localReplica.get(change.id);
+      const resolvedPath = this.resolvePathFromChangeId(change.id);
+      const replica = resolvedPath ? this.localReplica.get(resolvedPath) : undefined;
       if (replica?.remoteRev && change.rev && replica.remoteRev === change.rev) {
         result.skipped += 1;
         continue;
       }
 
       if (change.deleted) {
+        if (!resolvedPath) {
+          result.skipped += 1;
+          continue;
+        }
         if (replica?.deleted) {
           result.skipped += 1;
           continue;
@@ -127,7 +145,7 @@ export class SyncService {
         deletedDocs.push({
           _id: change.id,
           _rev: change.rev,
-          path: change.id,
+          path: resolvedPath,
           type: "plain",
           mtime: 0,
           deleted: true,
@@ -169,12 +187,12 @@ export class SyncService {
       return result;
     }
 
-    const remote = await this.client.getDocument(relativePath);
+    const remote = await this.client.getDocument(this.docId(relativePath));
     if (remote && !remote.deleted) {
       const remoteContent = await this.client.assembleContent(remote);
       const remoteHash = hashText(remoteContent);
       if (remoteHash === file.contentHash) {
-        await this.localReplica.upsert(this.toReplicaEntry(relativePath, file.contentHash, file.mtime, remote._rev, remote.mtime, false));
+        await this.localReplica.upsert(this.toReplicaEntry(relativePath, this.docId(relativePath), file.contentHash, file.mtime, remote._rev, remote.mtime, false));
         await this.metadata.clearConflict(relativePath);
         result.skipped = 1;
         return result;
@@ -186,11 +204,12 @@ export class SyncService {
         return result;
       }
     }
+    const docId = this.docId(relativePath);
     const response = await this.client.upsertDocument({
-      _id: relativePath, type: "plain", path: relativePath,
+      _id: docId, type: "plain", path: relativePath,
       data: file.content, mtime: file.mtime, deleted: false
     }, remote?._rev);
-    await this.localReplica.upsert(this.toReplicaEntry(relativePath, file.contentHash, file.mtime, response.rev, file.mtime, false));
+    await this.localReplica.upsert(this.toReplicaEntry(relativePath, docId, file.contentHash, file.mtime, response.rev, file.mtime, false));
     await this.metadata.clearConflict(relativePath);
     result.pushed = 1;
     return result;
@@ -199,7 +218,7 @@ export class SyncService {
   async pushDeletion(relativePath: string): Promise<boolean> {
     const tracked = this.localReplica.get(relativePath);
     if (!tracked || tracked.deleted) { return false; }
-    const response = await this.client.tombstoneDocument(relativePath, Date.now());
+    const response = await this.client.tombstoneDocument(this.docId(relativePath), relativePath, Date.now());
     if (!response) { return false; }
     await this.localReplica.markDeleted(relativePath, response.rev, Date.now());
     await this.metadata.clearConflict(relativePath);
@@ -238,7 +257,7 @@ export class SyncService {
   }
 
   async fetchRemoteForDiff(relativePath: string): Promise<{ content: string; doc: RemoteDocument } | undefined> {
-    const doc = await this.client.getDocument(relativePath);
+    const doc = await this.client.getDocument(this.docId(relativePath));
     if (!doc) { return undefined; }
     const content = await this.client.assembleContent(doc);
     return { content, doc };
@@ -247,6 +266,7 @@ export class SyncService {
   async resolveConflict(relativePath: string, choice: "local" | "remote"): Promise<void> {
     const tracked = this.metadata.get(relativePath);
     const replica = this.localReplica.get(relativePath);
+    const docId = this.docId(relativePath);
     if (choice === "local") {
       const uri = CouchDbClient.toUri(relativePath);
       if (!uri) { throw new Error(`Cannot resolve local URI for: ${relativePath}`); }
@@ -254,29 +274,29 @@ export class SyncService {
       let response;
       try {
         response = await this.client.upsertDocument({
-          _id: relativePath, type: "plain", path: relativePath,
+          _id: docId, type: "plain", path: relativePath,
           data: file.content, mtime: file.mtime, deleted: false
         }, tracked?.remoteRev ?? replica?.remoteRev);
       } catch (error) {
         if (!(error instanceof Error) || !error.message.includes("409")) { throw error; }
-        const latest = await this.client.getDocument(relativePath);
+        const latest = await this.client.getDocument(docId);
         response = await this.client.upsertDocument({
-          _id: relativePath, type: "plain", path: relativePath,
+          _id: docId, type: "plain", path: relativePath,
           data: file.content, mtime: file.mtime, deleted: false
         }, latest?._rev);
       }
       await this.metadata.clearConflict(relativePath);
-      await this.localReplica.upsert(this.toReplicaEntry(relativePath, hashText(file.content), file.mtime, response.rev, file.mtime, false));
+      await this.localReplica.upsert(this.toReplicaEntry(relativePath, docId, hashText(file.content), file.mtime, response.rev, file.mtime, false));
       this.logger.info(`Conflict resolved (accept local): ${relativePath}`);
     } else {
-      const remote = await this.client.getDocument(relativePath);
+      const remote = await this.client.getDocument(docId);
       if (!remote) { throw new Error(`Remote document not found: ${relativePath}`); }
       await this.writeLocalDocument(remote);
       const uri = CouchDbClient.toUri(relativePath);
       const stat = uri ? await vscode.workspace.fs.stat(uri) : undefined;
       const remoteContent = await this.client.assembleContent(remote);
       await this.metadata.clearConflict(relativePath);
-      await this.localReplica.upsert(this.toReplicaEntry(relativePath, hashText(remoteContent), stat?.mtime ?? Date.now(), remote._rev, remote.mtime, false));
+      await this.localReplica.upsert(this.toReplicaEntry(relativePath, docId, hashText(remoteContent), stat?.mtime ?? Date.now(), remote._rev, remote.mtime, false));
       this.logger.info(`Conflict resolved (accept remote): ${relativePath}`);
     }
     void tracked;
@@ -311,7 +331,7 @@ export class SyncService {
       const docHash = hashText(remoteContent);
       const existing = await this.readLocalIfExists(target);
       if (existing && existing.contentHash === docHash) {
-        await this.localReplica.upsert(this.toReplicaEntry(doc.path, docHash, existing.mtime, doc._rev, doc.mtime, false));
+        await this.localReplica.upsert(this.toReplicaEntry(doc.path, doc._id, docHash, existing.mtime, doc._rev, doc.mtime, false));
         await this.metadata.clearConflict(doc.path);
         result.skipped += 1;
         continue;
@@ -324,14 +344,14 @@ export class SyncService {
       }
       await this.writeToLocal(doc.path, remoteContent);
       const stat = await vscode.workspace.fs.stat(target);
-      await this.localReplica.upsert(this.toReplicaEntry(doc.path, docHash, stat.mtime, doc._rev, doc.mtime, false));
+      await this.localReplica.upsert(this.toReplicaEntry(doc.path, doc._id, docHash, stat.mtime, doc._rev, doc.mtime, false));
       await this.metadata.clearConflict(doc.path);
       result.pulled += 1;
     }
   }
 
-  private toReplicaEntry(relativePath: string, contentHash: string, localMtime: number, remoteRev: string | undefined, remoteMtime: number, deleted: boolean) {
-    return { path: relativePath, contentHash, localMtime, remoteRev, remoteMtime, deleted, updatedAt: Date.now() };
+  private toReplicaEntry(relativePath: string, documentId: string, contentHash: string, localMtime: number, remoteRev: string | undefined, remoteMtime: number, deleted: boolean) {
+    return { path: relativePath, documentId, contentHash, localMtime, remoteRev, remoteMtime, deleted, updatedAt: Date.now() };
   }
 
   private hasRemoteConflict(trackedRemoteRev: string | undefined, remoteRev: string | undefined, localHash: string, remoteHash: string): boolean {

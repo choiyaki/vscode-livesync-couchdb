@@ -4,7 +4,7 @@ import { CouchDbClient } from "./couchdb";
 import { LocalReplicaStore } from "./localReplicaStore";
 import { LiveSyncLogger } from "./log";
 import { MetadataStore } from "./metadataStore";
-import { getPassword, setPassword } from "./secrets";
+import { getPassword, getPassphrase, setPassword, setPassphrase } from "./secrets";
 import { LiveSyncStatusBar } from "./status";
 import { SyncService } from "./syncService";
 import { matchesFileConfig } from "./workspaceFiles";
@@ -102,7 +102,8 @@ export function activate(context: vscode.ExtensionContext): void {
     }
 
     const client = new CouchDbClient(config, password);
-    const service = new SyncService(config, client, logger, metadata, localReplica);
+    const passphrase = (await getPassphrase(context)) || undefined;
+    const service = new SyncService(config, client, logger, metadata, localReplica, passphrase);
     statusBar.setBusy(label);
     try {
       return await callback(service);
@@ -183,10 +184,21 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
+    const passphrase = await vscode.window.showInputBox({
+      prompt: "E2EE passphrase (Path Obfuscation key — leave empty if not used)",
+      password: true,
+      ignoreFocusOut: true,
+      value: ""
+    });
+    if (passphrase === undefined) {
+      return;
+    }
+
     await setConfigValue("couchdb.url", url.trim());
     await setConfigValue("couchdb.database", database.trim());
     await setConfigValue("couchdb.username", username.trim());
     await setPassword(context, password);
+    await setPassphrase(context, passphrase);
     logger.info("CouchDB configuration updated.");
     vscode.window.showInformationMessage("LiveSync CouchDB configuration saved.");
   });
