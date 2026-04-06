@@ -10,6 +10,49 @@ function trimSlash(value: string): string {
   return value.endsWith("/") ? value.slice(0, -1) : value;
 }
 
+function withDefaultProtocol(value: string): string {
+  return /^[a-z][a-z0-9+.-]*:\/\//i.test(value) ? value : `http://${value}`;
+}
+
+function ensureValidBaseUrl(value: string): string {
+  const candidate = withDefaultProtocol(value.trim());
+  let parsed: URL;
+  try {
+    parsed = new URL(candidate);
+  } catch {
+    throw new Error(`Invalid CouchDB URL: ${value}`);
+  }
+
+  if (!parsed.hostname) {
+    throw new Error(`Invalid CouchDB URL: ${value}`);
+  }
+
+  return trimSlash(parsed.toString());
+}
+
+function describeFetchFailure(error: unknown): string {
+  if (!(error instanceof Error)) {
+    return String(error);
+  }
+
+  const parts = [error.message];
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (cause && typeof cause === "object") {
+    const causeObj = cause as { code?: string; errno?: number | string; message?: string };
+    if (causeObj.code) {
+      parts.push(`code=${causeObj.code}`);
+    }
+    if (causeObj.errno !== undefined) {
+      parts.push(`errno=${causeObj.errno}`);
+    }
+    if (causeObj.message) {
+      parts.push(`cause=${causeObj.message}`);
+    }
+  }
+
+  return parts.join(", ");
+}
+
 function createLeafId(content: string): string {
   const hash = crypto.createHash("sha256").update(content, "utf8").digest("hex");
   return `f:${hash}`;
@@ -20,27 +63,39 @@ function isLikelyLeafId(id: string): boolean {
 }
 
 export class CouchDbClient {
+  private readonly baseUrl: string;
+
   constructor(
     private readonly config: LiveSyncConfig,
     private readonly password: string
-  ) {}
+  ) {
+    this.baseUrl = ensureValidBaseUrl(config.url);
+  }
 
   private get databaseUrl(): string {
-    return `${trimSlash(this.config.url)}/${encodeURIComponent(this.config.database)}`;
+    return `${this.baseUrl}/${encodeURIComponent(this.config.database)}`;
   }
 
   private async request<T>(path: string, init?: RequestInit): Promise<T> {
-    const response = await fetch(`${this.databaseUrl}${path}`, {
-      ...init,
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: buildAuthHeader(this.config.username, this.password),
-        ...(init?.headers ?? {})
-      }
-    });
+    const url = `${this.databaseUrl}${path}`;
+    const method = init?.method ?? "GET";
+    let response: Response;
+    try {
+      response = await fetch(url, {
+        ...init,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: buildAuthHeader(this.config.username, this.password),
+          ...(init?.headers ?? {})
+        }
+      });
+    } catch (error) {
+      const details = describeFetchFailure(error);
+      throw new Error(`CouchDB request failed (${method} ${url}): ${details}`, { cause: error });
+    }
 
     if (!response.ok) {
-      throw new Error(`CouchDB request failed: ${response.status} ${response.statusText}`);
+      throw new Error(`CouchDB request failed (${method} ${url}): ${response.status} ${response.statusText}`);
     }
 
     if (response.status === 204) {

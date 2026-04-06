@@ -14,6 +14,8 @@ let runningAutoPull: Promise<void> | undefined;
 let syncQueue: Promise<void> = Promise.resolve();
 const latestSaveUris = new Map<string, vscode.Uri>();
 const scheduledSavePushes = new Set<string>();
+const pendingDeleteTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const DELETE_SYNC_DEBOUNCE_MS = 1500;
 
 export function activate(context: vscode.ExtensionContext): void {
   const logger = new LiveSyncLogger();
@@ -124,6 +126,46 @@ export function activate(context: vscode.ExtensionContext): void {
 
   const register = (command: string, handler: () => Promise<void>) => {
     context.subscriptions.push(vscode.commands.registerCommand(command, handler));
+  };
+
+  const cancelPendingDelete = (relativePath: string): void => {
+    const timer = pendingDeleteTimers.get(relativePath);
+    if (!timer) {
+      return;
+    }
+
+    clearTimeout(timer);
+    pendingDeleteTimers.delete(relativePath);
+  };
+
+  const scheduleDeletePush = (uri: vscode.Uri): void => {
+    const relativePath = vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/");
+    cancelPendingDelete(relativePath);
+
+    const timer = setTimeout(() => {
+      pendingDeleteTimers.delete(relativePath);
+      void enqueueSyncOperation(async () => {
+        const localUri = CouchDbClient.toUri(relativePath);
+        if (localUri) {
+          try {
+            await vscode.workspace.fs.stat(localUri);
+            logger.info(`Skipped delete-sync because file exists: ${relativePath}`);
+            return;
+          } catch {
+            // File is absent; proceed tombstone sync.
+          }
+        }
+
+        await runWithClient("delete-sync", async (service) => {
+          const deleted = await service.pushDeletion(relativePath);
+          if (deleted) {
+            logger.info(`Deleted remote document: ${relativePath}`);
+          }
+        });
+      });
+    }, DELETE_SYNC_DEBOUNCE_MS);
+
+    pendingDeleteTimers.set(relativePath, timer);
   };
 
   const scheduleSavePush = (uri: vscode.Uri): void => {
@@ -364,6 +406,7 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
+    cancelPendingDelete(relPath);
     scheduleSavePush(document.uri);
   });
 
@@ -378,17 +421,28 @@ export function activate(context: vscode.ExtensionContext): void {
       return;
     }
 
-    await enqueueSyncOperation(async () => {
-      await runWithClient("delete-sync", async (service) => {
-        const deleted = await service.pushDeletion(relativePath);
-        if (deleted) {
-          logger.info(`Deleted remote document: ${relativePath}`);
-        }
-      });
-    });
+    scheduleDeletePush(uri);
   });
 
-  context.subscriptions.push(watcher, saveSubscription, deleteSubscription);
+  const createSubscription = watcher.onDidCreate((uri: vscode.Uri) => {
+    const relativePath = vscode.workspace.asRelativePath(uri, false).replace(/\\/g, "/");
+    cancelPendingDelete(relativePath);
+  });
+
+  context.subscriptions.push(
+    watcher,
+    saveSubscription,
+    deleteSubscription,
+    createSubscription,
+    {
+      dispose: () => {
+        for (const timer of pendingDeleteTimers.values()) {
+          clearTimeout(timer);
+        }
+        pendingDeleteTimers.clear();
+      }
+    }
+  );
 
   // ── Startup sync ──────────────────────────────────────────
   const startupConfig = getConfig();
