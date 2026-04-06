@@ -129,6 +129,7 @@ export class SyncService {
       const replica = resolvedPath ? this.localReplica.get(resolvedPath) : undefined;
       if (replica?.remoteRev && change.rev && replica.remoteRev === change.rev) {
         result.skipped += 1;
+        this.logger.info(`Pull skipped (rev unchanged): ${change.id}`);
         continue;
       }
 
@@ -305,7 +306,11 @@ export class SyncService {
   private async applyRemoteDocuments(docs: RemoteDocument[], result: SyncResult): Promise<void> {
     for (const doc of docs) {
       const tracked = this.localReplica.get(doc.path);
-      if (!matchesFileConfig(doc.path, this.config)) { result.skipped += 1; continue; }
+      if (!matchesFileConfig(doc.path, this.config)) {
+        result.skipped += 1;
+        this.logger.info(`Pull skipped (excluded): ${doc.path}`);
+        continue;
+      }
       if (doc.deleted) {
         await this.deleteLocalFile(doc.path);
         await this.localReplica.markDeleted(doc.path, doc._rev, doc.mtime);
@@ -334,6 +339,7 @@ export class SyncService {
         await this.localReplica.upsert(this.toReplicaEntry(doc.path, doc._id, docHash, existing.mtime, doc._rev, doc.mtime, false));
         await this.metadata.clearConflict(doc.path);
         result.skipped += 1;
+        this.logger.info(`Pull skipped (content unchanged): ${doc.path}`);
         continue;
       }
       if (existing && tracked && this.hasBidirectionalConflict(tracked, existing.contentHash, doc._rev, docHash)) {

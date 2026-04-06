@@ -1,5 +1,15 @@
 import * as vscode from "vscode";
 
+function appendErrorDetails(output: vscode.OutputChannel, error: Error, prefix = ""): void {
+  output.appendLine(prefix + (error.stack ?? error.message));
+  const cause = (error as Error & { cause?: unknown }).cause;
+  if (cause instanceof Error) {
+    appendErrorDetails(output, cause, `${prefix}caused by: `);
+  } else if (cause) {
+    output.appendLine(`${prefix}caused by: ${String(cause)}`);
+  }
+}
+
 export class LiveSyncLogger {
   private readonly output = vscode.window.createOutputChannel("LiveSync CouchDB");
 
@@ -14,7 +24,7 @@ export class LiveSyncLogger {
   error(message: string, error?: unknown): void {
     this.output.appendLine(`[error] ${message}`);
     if (error instanceof Error) {
-      this.output.appendLine(error.stack ?? error.message);
+      appendErrorDetails(this.output, error);
     } else if (error) {
       this.output.appendLine(String(error));
     }
