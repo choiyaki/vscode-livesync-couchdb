@@ -2,7 +2,7 @@
   "name": "vscode-livesync-couchdb",
   "displayName": "LiveSync CouchDB",
   "description": "CouchDB-only LiveSync extension for VS Code workspaces.",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "publisher": "local-dev",
   "license": "MIT",
   "repository": {
