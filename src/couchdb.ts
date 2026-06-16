@@ -342,23 +342,69 @@ export class CouchDbClient {
     }
   }
 
-  async tombstoneDocument(docId: string, originalPath: string, mtime: number): Promise<CouchDbWriteResponse | undefined> {
-    const existing = await this.getDocument(docId);
-    if (!existing) {
-      return undefined;
+  /**
+   * ドキュメントを CouchDB ネイティブ削除する（couchNotes の deleteNote と同じ方式）。
+   * `PUT {_id,_rev,_deleted:true}` で本物の墓標(tombstone)を作る。本文フィールドは消え、
+   * `_id/_rev/_deleted` だけが残る。これは `_changes` に `deleted:true` として流れ、
+   * `_all_docs`/`_find` からは（既定で）除外される——これが唯一の削除信号になる。
+   *
+   * Obsidian LiveSync 流のソフト削除（`deleted:true` フィールドを残す方式）は使わない。
+   * couchNotes はソフト削除を削除信号として認識しないため、双方向で削除が伝わらないからである。
+   *
+   * 既に存在しない（または既に墓標）なら何もせず undefined を返す。
+   * 409（rev が進んでいた）は rev を取り直して最大2回まで再試行する。
+   */
+  async tombstoneDocument(docId: string, _originalPath: string, _mtime: number): Promise<CouchDbWriteResponse | undefined> {
+    for (let attempt = 0; attempt < 2; attempt++) {
+      const existing = await this.getDocument(docId);
+      // GET は削除済み（墓標）に対して 404 → undefined を返すため、これで「既に無い」を判定できる。
+      if (!existing || !existing._rev) {
+        return undefined;
+      }
+      const body = { _id: existing._id, _rev: existing._rev, _deleted: true };
+      try {
+        return await this.request<CouchDbWriteResponse>(`/${encodeURIComponent(existing._id)}`, {
+          method: "PUT",
+          body: JSON.stringify(body)
+        });
+      } catch (error) {
+        if (error instanceof Error && error.message.includes("409")) {
+          continue; // 競合: rev を取り直して再試行
+        }
+        throw error;
+      }
     }
+    return undefined;
+  }
 
-    return await this.upsertDocument({
-      _id: existing._id,
-      _rev: existing._rev,
-      type: "plain",
-      path: originalPath,
-      data: "",
-      mtime,
-      ctime: existing.ctime ?? mtime,
-      size: 0,
-      deleted: true
-    });
+  /**
+   * サーバ上に「生存している」ドキュメントの id→rev マップを返す（couchNotes の liveNoteRevs 相当）。
+   * `_all_docs` は本文を含まず、ネイティブ削除（墓標）は既定で返さないため、
+   * 「正＝サーバ」の生存集合を軽量に取得できる。リコンシリエーションの土台。
+   *
+   * 設計判断（安全側）: ここではフォルダスコープで絞らず、`_` 始まり（設計/ローカル文書）と
+   * `h:`（leaf チャンク）だけを除外して**生存集合を広めに**返す。スコープ絞り込みは呼び出し側
+   * （ローカル追跡ファイル側）で行う。サーバ集合を絞り込むと「サーバに無い＝削除」と誤判定して
+   * ローカルを過剰削除する危険があるため、サーバ側は絞らない。
+   */
+  async liveNoteRevs(): Promise<Map<string, string>> {
+    const result = await this.request<{
+      rows: Array<{ id: string; value?: { rev?: string; deleted?: boolean } }>;
+    }>("/_all_docs");
+
+    const out = new Map<string, string>();
+    for (const row of result.rows) {
+      const id = row.id;
+      if (!id || id.startsWith("_") || isLikelyLeafId(id)) {
+        continue;
+      }
+      const rev = row.value?.rev;
+      if (!rev || row.value?.deleted) {
+        continue;
+      }
+      out.set(id, rev);
+    }
+    return out;
   }
 
   /**

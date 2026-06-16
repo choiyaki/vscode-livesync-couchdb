@@ -127,6 +127,79 @@ export class SyncService {
     });
     await this.applyRemoteDocuments(docs, result);
     await this.localReplica.updateCheckpoint({ remoteChangesSince: await this.client.getLatestSequence() });
+    // 全同期では reconcile で「サーバに無いノートのローカル物理削除」を収束させる。
+    // ネイティブ削除（墓標）は _find に出てこないため、ここで _all_docs と突き合わせて消す。
+    const recon = await this.reconcile();
+    result.pulled += recon.pulled;
+    result.skipped += recon.skipped;
+    return result;
+  }
+
+  /**
+   * サーバ（正本）とローカルの存在を突き合わせ、サーバから消えたノートのローカルファイルを
+   * 物理削除して収束させる（couchNotes の reconcile 相当）。
+   *
+   * ネイティブ削除（_deleted:true の墓標）は `_find`/`_all_docs` に出てこないため、
+   * 差分 pull（_changes）を取りこぼすとローカルに残り続ける。これに対する最終保証。
+   *
+   * 安全側の設計:
+   *  - サーバ応答が空（生存0件）なら異常の可能性 → 誤った全削除を避けて何もしない。
+   *  - スコープ外・コンフリクト中・未 push のローカル編集（dirty）は削除しない。
+   *    dirty は次の pushAll でサーバへ復活させる（編集を失わない）。
+   */
+  async reconcile(): Promise<SyncResult> {
+    const result = emptyResult();
+    const liveRevs = await this.client.liveNoteRevs();
+    if (liveRevs.size === 0) {
+      this.logger.warn("Reconcile skipped: server returned no live documents (guard against mass deletion).");
+      return result;
+    }
+
+    let deleted = 0;
+    for (const trackedPath of this.localReplica.listPaths()) {
+      const tracked = this.localReplica.get(trackedPath);
+      if (!tracked || tracked.deleted) {
+        continue;
+      }
+      // スコープ外（excluded/隠しパス/同期対象外フォルダ）は触らない。
+      if (!matchesFileConfig(trackedPath, this.config)) {
+        continue;
+      }
+      // コンフリクト中は解決を優先し、削除しない。
+      if (this.metadata.get(trackedPath)) {
+        continue;
+      }
+      const docId = tracked.documentId ?? this.docId(trackedPath);
+      if (liveRevs.has(docId)) {
+        continue; // サーバに生存 → 残す
+      }
+
+      // サーバに無い＝墓標（削除済み）。ローカルの状態を見て安全に処理する。
+      const uri = CouchDbClient.toUri(trackedPath);
+      const local = uri ? await this.readLocalIfExists(uri) : undefined;
+      if (!local) {
+        // 既にローカルにも無い → 追跡だけ削除済みに整える。
+        await this.localReplica.markDeleted(trackedPath, undefined, Date.now());
+        continue;
+      }
+      if (local.contentHash !== tracked.contentHash) {
+        // 未 push のローカル編集（delete vs edit）。削除すると失うため保護し、次の push で復活させる。
+        result.skipped += 1;
+        this.logger.warn(`Reconcile: kept locally-modified file deleted on server: ${trackedPath}`);
+        continue;
+      }
+
+      await this.deleteLocalFile(trackedPath);
+      await this.localReplica.markDeleted(trackedPath, undefined, Date.now());
+      await this.metadata.clearConflict(trackedPath);
+      result.pulled += 1;
+      deleted += 1;
+      this.logger.info(`Reconcile: deleted local file missing on server: ${trackedPath}`);
+    }
+
+    if (deleted > 0 || result.skipped > 0) {
+      this.logger.info(`Reconcile finished: deleted=${deleted}, protected=${result.skipped}`);
+    }
     return result;
   }
 

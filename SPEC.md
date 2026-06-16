@@ -175,8 +175,15 @@ constructor(config: LiveSyncConfig, password: string)
 | `getLatestSequence()` | `_changes?limit=0` で現在の最新シーケンスを取得 |
 | `pollChanges(since, timeoutMs, signal)` | `_changes?feed=longpoll` で long-polling |
 | `upsertDocument(doc, expectedRev?)` | ドキュメントを作成または更新 |
-| `tombstoneDocument(docId, originalPath, mtime)` | 削除フラグ付きドキュメント (tombstone) に更新 |
+| `tombstoneDocument(docId, _path, _mtime)` | CouchDB ネイティブ削除 (`PUT {_id,_rev,_deleted:true}`) で本物の墓標を作る。409 は rev 取り直して最大2回再試行。既に無ければ `undefined` |
+| `liveNoteRevs()` | `_all_docs` で「生存」ドキュメントの id→rev マップを返す（墓標は既定で除外）。reconcile の土台 |
 | `assembleContent(doc)` | ドキュメントのテキストコンテンツを組み立てる |
+
+> **削除モデル (couchNotes 準拠):** 削除は **CouchDB ネイティブ削除** (`_deleted:true` の墓標) で表現する。
+> Obsidian LiveSync 流のソフト削除 (`deleted:true` フィールドを残す方式) は **書き込まない**。
+> couchNotes はソフト削除を削除信号として認識しないため、ネイティブ削除でなければ双方向で削除が伝わらない。
+> ネイティブ削除は `_changes` に `deleted:true` として流れ、`_all_docs`/`_find` からは除外される——これが唯一の削除信号。
+> 受信側では、過去に書かれた `deleted:true` のソフト削除ドキュメントも削除として解釈する（後方互換）。
 
 #### ドキュメント書き込みの詳細 (`upsertDocument`)
 1. `_rev` が不明な場合、`getDocument` で現在のリビジョンを取得する。
@@ -380,7 +387,7 @@ CouchDB `/_changes?feed=longpoll` を使ったリアルタイム監視クラス�
 ワークスペース全ファイルをリモートに一括プッシュ。
 
 **ステップ:**
-1. **Tombstone プッシュ**: `localReplica` に記録があるが実際のファイルが存在しないパスを検出し、CouchDB 上で tombstone 化する。
+1. **Tombstone プッシュ**: `localReplica` に記録があるが実際のファイルが存在しないパスを検出し、CouchDB 上でネイティブ削除（墓標化）する。これでローカルの物理削除がリモート（および couchNotes 等の他端末）へ伝播する。
 2. **各ファイルのプッシュ判定:**
    - `localMtime` が変わっていない → `skipped`
    - `contentHash` が変わっていない → `skipped`
@@ -395,6 +402,20 @@ CouchDB `/_changes?feed=longpoll` を使ったリアルタイム監視クラス�
 #### `pullAll(): Promise<SyncResult>`
 全ドキュメントを `listDocuments()` で取得し、`applyRemoteDocuments` で適用。
 - 完了後にチェックポイントを現在の最新シーケンスに更新。
+- 最後に `reconcile()` を呼び、サーバから消えたノートのローカルファイルを物理削除する。
+
+#### `reconcile(): Promise<SyncResult>` (couchNotes 準拠の最終保証)
+ネイティブ削除（墓標）は `_find`/`_all_docs` に出てこないため、差分 pull（`_changes`）を取りこぼすと
+ローカルに残り続ける。これに対する収束処理。
+
+**ステップ:**
+1. `liveNoteRevs()` でサーバの**生存** id→rev を取得。**空なら異常の可能性 → 何もしない**（誤った全削除を防ぐ安全ガード）。
+2. `localReplica` の追跡パスを走査し、サーバ生存集合に `documentId` が無いものを「削除済み」とみなす。
+   - スコープ外（`matchesFileConfig` 不一致）/ コンフリクト中 / 既に削除済み → 触らない。
+   - 未 push のローカル編集（ローカルの `contentHash` が追跡値と異なる）→ 削除せず保護（`skipped`）。次の `pushAll` でサーバへ復活。
+   - クリーンなファイル → ローカル物理削除（`useTrash:false`）し、`localReplica` を削除済みに（`pulled`）。
+
+**自動実行タイミング:** 起動同期、手動「Sync Now」、全 Pull（`pullAll`）。差分 Pull（`pullIncremental`）単独では実行しない。
 
 ---
 

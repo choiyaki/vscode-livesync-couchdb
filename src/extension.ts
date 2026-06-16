@@ -383,10 +383,12 @@ export function activate(context: vscode.ExtensionContext): void {
         logger.show();
         const result = await service.pushAll().then(async (push) => {
           const pull = await service.pullIncremental();
+          // 差分 pull は墓標を取りこぼし得るため、全同期では reconcile で削除を収束させる。
+          const recon = await service.reconcile();
           return {
             pushed: push.pushed,
-            pulled: pull.pulled,
-            skipped: push.skipped + pull.skipped,
+            pulled: pull.pulled + recon.pulled,
+            skipped: push.skipped + pull.skipped + recon.skipped,
             conflicts: [...push.conflicts, ...pull.conflicts],
           };
         });
@@ -466,8 +468,10 @@ export function activate(context: vscode.ExtensionContext): void {
           logger.show();
           const push = await service.pushAll();
           const pull = await service.pullIncremental();
+          // 起動時は reconcile で「サーバから消えたノートのローカル物理削除」を収束させる。
+          const recon = await service.reconcile();
           logger.info(
-            `Startup sync finished: pushed=${push.pushed}, pulled=${pull.pulled}, skipped=${push.skipped + pull.skipped}, conflicts=${push.conflicts.length + pull.conflicts.length}`
+            `Startup sync finished: pushed=${push.pushed}, pulled=${pull.pulled + recon.pulled}, skipped=${push.skipped + pull.skipped + recon.skipped}, conflicts=${push.conflicts.length + pull.conflicts.length}`
           );
         });
       })
