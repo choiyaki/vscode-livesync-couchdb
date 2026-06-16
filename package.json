@@ -2,7 +2,7 @@
   "name": "vscode-livesync-couchdb",
   "displayName": "LiveSync CouchDB",
   "description": "CouchDB-only LiveSync extension for VS Code workspaces.",
-  "version": "0.0.3",
+  "version": "0.4.1",
   "publisher": "local-dev",
   "license": "MIT",
   "repository": {
@@ -95,13 +95,23 @@
         },
         "livesync.include": {
           "type": "string",
-          "default": "**/*.{md,txt,markdown}",
+          "default": "**/*.md",
           "description": "Glob of files to include during sync"
+        },
+        "livesync.syncedFolders": {
+          "type": "string",
+          "default": "",
+          "description": "Comma-separated folder names to sync in addition to root-level files. Root files (no slash) are always synced. Matching is case-insensitive. Leave empty to sync root-level files only (subfolders excluded). Mirrors couchNotes' syncedFolders."
         },
         "livesync.exclude": {
           "type": "string",
           "default": "**/.git/**,**/node_modules/**,**/.obsidian/**,**/.vscode/**,**/.DS_Store",
           "description": "Comma-separated globs to exclude from sync"
+        },
+        "livesync.liveSync": {
+          "type": "boolean",
+          "default": false,
+          "description": "Enable real-time sync: use CouchDB long-polling to detect remote changes instantly instead of (or in addition to) the interval timer."
         }
       }
     }

@@ -10,6 +10,28 @@ function normalizeExclude(value: string): string[] {
     .filter((entry) => entry.length > 0);
 }
 
+/**
+ * 同期フォルダを正規化する（couchNotes の SyncScope.normalize と対応）。
+ * 前後の空白と先頭・末尾の "/" を除去し、空・重複（大小無視）を除く。大小は path 照合のため保持。
+ */
+function normalizeFolders(value: string): string[] {
+  const seen = new Set<string>();
+  const result: string[] = [];
+  for (const raw of value.split(",")) {
+    const folder = raw.trim().replace(/^\/+|\/+$/g, "");
+    if (folder.length === 0) {
+      continue;
+    }
+    const key = folder.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(folder);
+  }
+  return result;
+}
+
 export function getConfig(): LiveSyncConfig {
   const config = vscode.workspace.getConfiguration(SECTION);
   return {
@@ -19,8 +41,11 @@ export function getConfig(): LiveSyncConfig {
     syncOnSave: config.get<boolean>("syncOnSave", true),
     syncOnStartup: config.get<boolean>("syncOnStartup", false),
     autoSyncIntervalSeconds: config.get<number>("autoSyncIntervalSeconds", 0),
-    include: config.get<string>("include", "**/*.{md,txt,markdown}"),
-    exclude: normalizeExclude(config.get<string>("exclude", "**/.git/**,**/node_modules/**,**/.obsidian/**,**/.vscode/**,**/.DS_Store"))
+    liveSync: config.get<boolean>("liveSync", false),
+    include: config.get<string>("include", "**/*.md"),
+
+    exclude: normalizeExclude(config.get<string>("exclude", "**/.git/**,**/node_modules/**,**/.obsidian/**,**/.vscode/**,**/.DS_Store")),
+    syncedFolders: normalizeFolders(config.get<string>("syncedFolders", ""))
   };
 }
 

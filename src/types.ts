@@ -7,8 +7,15 @@ export interface LiveSyncConfig {
   syncOnSave: boolean;
   syncOnStartup: boolean;
   autoSyncIntervalSeconds: number;
+  liveSync: boolean;
   include: string;
   exclude: string[];
+  /**
+   * 同期対象フォルダの許可リスト（正規化済み: 前後の空白と "/" を除去）。
+   * ルート直下（スラッシュ無し）は常に同期し、加えてここに挙げたフォルダ配下を同期する。
+   * 空配列ならルート直下のみ同期（サブフォルダは対象外）。couchNotes の syncedFolders と対応。
+   */
+  syncedFolders: string[];
 }
 
 export type ObsidianDocType = "plain" | "newnote" | "leaf";
@@ -69,7 +76,13 @@ export interface WorkspaceFile {
 export interface LocalReplicaDocument {
   path: string;
   documentId?: string;
+  /** 前回同期内容の正規化ハッシュ (canonicalHash)。phantom 判定の base。 */
   contentHash: string;
+  /**
+   * 前回同期した内容そのもの（生テキスト）。3-way マージ（案B）と、
+   * ハッシュに頼らない確実な「ローカルが変わったか」判定に使う。任意。
+   */
+  baseContent?: string;
   localMtime: number;
   remoteRev?: string;
   remoteMtime: number;

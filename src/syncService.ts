@@ -6,7 +6,7 @@ import { LiveSyncLogger } from "./log";
 import { MetadataStore } from "./metadataStore";
 import { path2id, isObfuscatedId } from "./pathObfuscation";
 import { LiveSyncConfig, RemoteDocument, SyncResult } from "./types";
-import { getRelativePath, hashText, listWorkspaceFiles, matchesFileConfig, readWorkspaceFile } from "./workspaceFiles";
+import { canonicalHash, getRelativePath, listWorkspaceFiles, matchesFileConfig, readWorkspaceFile } from "./workspaceFiles";
 
 function emptyResult(): SyncResult {
   return { pushed: 0, pulled: 0, skipped: 0, conflicts: [] };
@@ -44,6 +44,10 @@ export class SyncService {
       if (!tracked || tracked.deleted || localPathSet.has(trackedPath)) {
         continue;
       }
+      // スコープ外になっただけのファイルを「ローカルから消えた＝削除」と誤認しないよう除外。
+      if (!matchesFileConfig(trackedPath, this.config)) {
+        continue;
+      }
       const trackedDocId = this.docId(trackedPath);
       const response = await this.client.tombstoneDocument(trackedDocId, trackedPath, Date.now());
       if (response) {
@@ -72,11 +76,19 @@ export class SyncService {
       const remote = await this.client.getDocument(this.docId(file.relativePath));
       if (remote && !remote.deleted) {
         const remoteContent = await this.client.assembleContent(remote);
-        const remoteHash = hashText(remoteContent);
+        const remoteHash = canonicalHash(remoteContent);
         if (remoteHash === file.contentHash) {
-          await this.localReplica.upsert(this.toReplicaEntry(file.relativePath, this.docId(file.relativePath), file.contentHash, file.mtime, remote._rev, remote.mtime, false));
+          await this.localReplica.upsert(this.toReplicaEntry(file.relativePath, this.docId(file.relativePath), file.contentHash, file.mtime, remote._rev, remote.mtime, false, file.content));
           await this.metadata.clearConflict(file.relativePath);
           result.skipped += 1;
+          continue;
+        }
+        // ④ ガード: 共有 base（remoteRev）が無いのに remote が別内容で存在
+        //   = 同名ファイルが両端末で独立に作られた状態。黙って上書きするとデータ消失するため衝突扱い。
+        if (!replica?.remoteRev) {
+          result.conflicts.push(file.relativePath);
+          this.logger.warn(`Push skipped: untracked remote document with different content: ${file.relativePath}`);
+          await this.metadata.setConflict(file.relativePath, remote._rev);
           continue;
         }
         if (this.hasRemoteConflict(replica?.remoteRev, remote._rev, file.contentHash, remoteHash)) {
@@ -98,7 +110,7 @@ export class SyncService {
         _id: docId, type: "plain", path: file.relativePath,
         data: file.content, mtime: file.mtime, deleted: false
       }, remote?._rev);
-      await this.localReplica.upsert(this.toReplicaEntry(file.relativePath, docId, file.contentHash, file.mtime, response.rev, file.mtime, false));
+      await this.localReplica.upsert(this.toReplicaEntry(file.relativePath, docId, file.contentHash, file.mtime, response.rev, file.mtime, false, file.content));
       await this.metadata.clearConflict(file.relativePath);
       result.pushed += 1;
     }
@@ -107,7 +119,12 @@ export class SyncService {
 
   async pullAll(): Promise<SyncResult> {
     const result = emptyResult();
-    const docs = await this.client.listDocuments();
+    const docs = await this.client.listDocumentsInScope({
+      folders: this.config.syncedFolders,
+      // passphrase（Path Obfuscation）有効時は _id がパスを表さず範囲指定できないため、
+      // サーバ側スコープ絞り込みは無効化し applyRemoteDocuments のクライアント側フィルタに委ねる。
+      canScopeById: !this.passphrase
+    });
     await this.applyRemoteDocuments(docs, result);
     await this.localReplica.updateCheckpoint({ remoteChangesSince: await this.client.getLatestSequence() });
     return result;
@@ -191,11 +208,18 @@ export class SyncService {
     const remote = await this.client.getDocument(this.docId(relativePath));
     if (remote && !remote.deleted) {
       const remoteContent = await this.client.assembleContent(remote);
-      const remoteHash = hashText(remoteContent);
+      const remoteHash = canonicalHash(remoteContent);
       if (remoteHash === file.contentHash) {
-        await this.localReplica.upsert(this.toReplicaEntry(relativePath, this.docId(relativePath), file.contentHash, file.mtime, remote._rev, remote.mtime, false));
+        await this.localReplica.upsert(this.toReplicaEntry(relativePath, this.docId(relativePath), file.contentHash, file.mtime, remote._rev, remote.mtime, false, file.content));
         await this.metadata.clearConflict(relativePath);
         result.skipped = 1;
+        return result;
+      }
+      // ④ ガード: 共有 base が無いのに remote が別内容で存在 → 独立作成。黙って上書きせず衝突に。
+      if (!replica?.remoteRev) {
+        result.conflicts.push(relativePath);
+        this.logger.warn(`Save sync skipped: untracked remote document with different content: ${relativePath}`);
+        await this.metadata.setConflict(relativePath, remote._rev);
         return result;
       }
       if (this.hasRemoteConflict(replica?.remoteRev, remote._rev, file.contentHash, remoteHash)) {
@@ -210,7 +234,7 @@ export class SyncService {
       _id: docId, type: "plain", path: relativePath,
       data: file.content, mtime: file.mtime, deleted: false
     }, remote?._rev);
-    await this.localReplica.upsert(this.toReplicaEntry(relativePath, docId, file.contentHash, file.mtime, response.rev, file.mtime, false));
+    await this.localReplica.upsert(this.toReplicaEntry(relativePath, docId, file.contentHash, file.mtime, response.rev, file.mtime, false, file.content));
     await this.metadata.clearConflict(relativePath);
     result.pushed = 1;
     return result;
@@ -249,11 +273,11 @@ export class SyncService {
     try { await vscode.workspace.fs.delete(uri, { useTrash: false }); } catch { return; }
   }
 
-  private async readLocalIfExists(uri: vscode.Uri): Promise<{ contentHash: string; mtime: number } | undefined> {
+  private async readLocalIfExists(uri: vscode.Uri): Promise<{ contentHash: string; mtime: number; content: string } | undefined> {
     try {
       const stat = await vscode.workspace.fs.stat(uri);
       const content = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString("utf8");
-      return { contentHash: hashText(content), mtime: stat.mtime };
+      return { contentHash: canonicalHash(content), mtime: stat.mtime, content };
     } catch { return undefined; }
   }
 
@@ -287,7 +311,7 @@ export class SyncService {
         }, latest?._rev);
       }
       await this.metadata.clearConflict(relativePath);
-      await this.localReplica.upsert(this.toReplicaEntry(relativePath, docId, hashText(file.content), file.mtime, response.rev, file.mtime, false));
+      await this.localReplica.upsert(this.toReplicaEntry(relativePath, docId, canonicalHash(file.content), file.mtime, response.rev, file.mtime, false, file.content));
       this.logger.info(`Conflict resolved (accept local): ${relativePath}`);
     } else {
       const remote = await this.client.getDocument(docId);
@@ -297,7 +321,7 @@ export class SyncService {
       const stat = uri ? await vscode.workspace.fs.stat(uri) : undefined;
       const remoteContent = await this.client.assembleContent(remote);
       await this.metadata.clearConflict(relativePath);
-      await this.localReplica.upsert(this.toReplicaEntry(relativePath, docId, hashText(remoteContent), stat?.mtime ?? Date.now(), remote._rev, remote.mtime, false));
+      await this.localReplica.upsert(this.toReplicaEntry(relativePath, docId, canonicalHash(remoteContent), stat?.mtime ?? Date.now(), remote._rev, remote.mtime, false, remoteContent));
       this.logger.info(`Conflict resolved (accept remote): ${relativePath}`);
     }
     void tracked;
@@ -333,13 +357,21 @@ export class SyncService {
           `Pull produced empty content: path=${doc.path}, type=${doc.type}, datatype=${doc.datatype ?? ""}, dataKind=${dataKind}, dataLength=${dataLength}, children=${childrenLength}, size=${doc.size ?? 0}, deleted=${doc.deleted ? "true" : "false"}`
         );
       }
-      const docHash = hashText(remoteContent);
+      const docHash = canonicalHash(remoteContent);
       const existing = await this.readLocalIfExists(target);
       if (existing && existing.contentHash === docHash) {
-        await this.localReplica.upsert(this.toReplicaEntry(doc.path, doc._id, docHash, existing.mtime, doc._rev, doc.mtime, false));
+        await this.localReplica.upsert(this.toReplicaEntry(doc.path, doc._id, docHash, existing.mtime, doc._rev, doc.mtime, false, remoteContent));
         await this.metadata.clearConflict(doc.path);
         result.skipped += 1;
         this.logger.info(`Pull skipped (content unchanged): ${doc.path}`);
+        continue;
+      }
+      // ④ ガード: 追跡情報の無いローカルファイルが remote と別内容で存在
+      //   = 同名ファイルの独立作成。remote で黙って上書きするとローカルの内容が消えるため衝突に。
+      if (existing && !tracked) {
+        result.conflicts.push(doc.path);
+        this.logger.warn(`Pull skipped: untracked local file differs from remote: ${doc.path}`);
+        await this.metadata.setConflict(doc.path, doc._rev);
         continue;
       }
       if (existing && tracked && this.hasBidirectionalConflict(tracked, existing.contentHash, doc._rev, docHash)) {
@@ -350,14 +382,14 @@ export class SyncService {
       }
       await this.writeToLocal(doc.path, remoteContent);
       const stat = await vscode.workspace.fs.stat(target);
-      await this.localReplica.upsert(this.toReplicaEntry(doc.path, doc._id, docHash, stat.mtime, doc._rev, doc.mtime, false));
+      await this.localReplica.upsert(this.toReplicaEntry(doc.path, doc._id, docHash, stat.mtime, doc._rev, doc.mtime, false, remoteContent));
       await this.metadata.clearConflict(doc.path);
       result.pulled += 1;
     }
   }
 
-  private toReplicaEntry(relativePath: string, documentId: string, contentHash: string, localMtime: number, remoteRev: string | undefined, remoteMtime: number, deleted: boolean) {
-    return { path: relativePath, documentId, contentHash, localMtime, remoteRev, remoteMtime, deleted, updatedAt: Date.now() };
+  private toReplicaEntry(relativePath: string, documentId: string, contentHash: string, localMtime: number, remoteRev: string | undefined, remoteMtime: number, deleted: boolean, baseContent?: string) {
+    return { path: relativePath, documentId, contentHash, baseContent, localMtime, remoteRev, remoteMtime, deleted, updatedAt: Date.now() };
   }
 
   private hasRemoteConflict(trackedRemoteRev: string | undefined, remoteRev: string | undefined, localHash: string, remoteHash: string): boolean {

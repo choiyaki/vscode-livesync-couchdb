@@ -4,6 +4,7 @@ import { CouchDbClient } from "./couchdb";
 import { LocalReplicaStore } from "./localReplicaStore";
 import { LiveSyncLogger } from "./log";
 import { MetadataStore } from "./metadataStore";
+import { RemoteWatcher } from "./remoteWatcher";
 import { getPassword, getPassphrase, setPassword, setPassphrase } from "./secrets";
 import { LiveSyncStatusBar } from "./status";
 import { SyncService } from "./syncService";
@@ -482,6 +483,50 @@ export function activate(context: vscode.ExtensionContext): void {
     logger.info("Startup sync is enabled but CouchDB is not configured; skipping startup sync.");
   }
 
+  // ── Remote watcher (live sync) ──────────────────────────
+  const makeWatcherClient = async (): Promise<CouchDbClient | undefined> => {
+    const cfg = getConfig();
+    if (!isConfigured(cfg)) return undefined;
+    const pwd = await getPassword(context);
+    if (!pwd) return undefined;
+    return new CouchDbClient(cfg, pwd);
+  };
+
+  const remoteWatcher = new RemoteWatcher(
+    makeWatcherClient,
+    () => localReplica.getCheckpoint().remoteChangesSince,
+    () => {
+      void enqueueSyncOperation(async () => {
+        await runWithClient("live-pull", async (service) => {
+          const result = await service.pullIncremental();
+          if (result.pulled > 0 || result.conflicts.length > 0) {
+            logger.info(`Live pull: pulled=${result.pulled}, conflicts=${result.conflicts.length}`);
+          }
+        });
+      });
+    },
+    logger
+  );
+
+  context.subscriptions.push({ dispose: () => remoteWatcher.stop() });
+
+  const applyLiveSyncConfig = (): void => {
+    const cfg = getConfig();
+    if (cfg.liveSync && isConfigured(cfg)) {
+      remoteWatcher.start();
+    } else {
+      remoteWatcher.stop();
+    }
+  };
+
+  context.subscriptions.push(
+    vscode.workspace.onDidChangeConfiguration((e) => {
+      if (e.affectsConfiguration("livesync")) {
+        applyLiveSyncConfig();
+      }
+    })
+  );
+
   // ── Auto-pull timer ───────────────────────────────────────
   const intervalSec = startupConfig.autoSyncIntervalSeconds;
   if (intervalSec > 0) {
@@ -518,6 +563,9 @@ export function activate(context: vscode.ExtensionContext): void {
   }
 
   logger.info("LiveSync CouchDB extension activated.");
+
+  // liveSync 設定に基づいてリアルタイム監視を開始（設定変更時も再評価される）
+  applyLiveSyncConfig();
 }
 
 export function deactivate(): void {

@@ -62,6 +62,30 @@ function isLikelyLeafId(id: string): boolean {
   return /^h:[0-9a-z]{8,}$/i.test(id);
 }
 
+/**
+ * 同期スコープを表す Mango selector を組み立てる（couchNotes の scopeSelector と対応）。
+ * type は plain / newnote の両方を対象にする。`_id` 範囲で絞れる場合は
+ * ルート（`^[^/]+$`）＋各フォルダ前方一致の `$or` を付与する。
+ * folders が空ならルート直下のみ（サブフォルダは対象外）。
+ *
+ * canScopeById が false（Path Obfuscation 有効で `_id` がパスを表さない）の場合は
+ * `_id` 範囲指定ができないため type のみで取得し、絞り込みはクライアント側に委ねる。
+ */
+function buildScopeSelector(scope: { folders: string[]; canScopeById: boolean }): Record<string, unknown> {
+  const selector: Record<string, unknown> = { type: { $in: ["plain", "newnote"] } };
+  if (!scope.canScopeById) {
+    return selector;
+  }
+  const ors: Array<Record<string, unknown>> = [{ _id: { $regex: "^[^/]+$" } }];
+  for (const folder of scope.folders) {
+    const lf = folder.toLowerCase();
+    // "0" は "/" (0x2F) の次の文字 (0x30)。lf/ 〜 lf0 の半開区間で lf 配下を網羅する。
+    ors.push({ _id: { $gte: `${lf}/`, $lt: `${lf}0` } });
+  }
+  selector["$or"] = ors;
+  return selector;
+}
+
 export class CouchDbClient {
   private readonly baseUrl: string;
 
@@ -122,11 +146,44 @@ export class CouchDbClient {
     }
   }
 
-  async listDocuments(): Promise<RemoteDocument[]> {
-    const result = await this.request<{ rows: Array<{ id: string; doc?: RemoteDocument }> }>("/_all_docs?include_docs=true");
-    return result.rows.flatMap((row) => {
-      return this.normalizeRemoteDocument(row.doc);
-    });
+  /**
+   * 同期スコープ内のドキュメントを Mango `_find` で取得する。
+   *
+   * couchNotes の scopeSelector と同じ範囲指定:
+   *   - ルート直下: `_id` が "/" を含まない（`^[^/]+$`）
+   *   - 各フォルダ: `_id` の前方一致を範囲クエリ `$gte:"f/"` / `$lt:"f0"` で表現（"0" は "/" の次の文字）
+   * `_id` は小文字なので folders も小文字化して照合する。
+   *
+   * scope.canScopeById が false（passphrase による Path Obfuscation 有効＝`_id` がパスを表さない）
+   * または folders が空（全フォルダ同期）の場合は `_id` 範囲指定を付けず、type のみで取得する。
+   * type は Obsidian LiveSync 互換のため plain / newnote の両方を対象にする（couchNotes は plain のみ生成）。
+   */
+  async listDocumentsInScope(scope: { folders: string[]; canScopeById: boolean }): Promise<RemoteDocument[]> {
+    const selector = buildScopeSelector(scope);
+    const pageLimit = 1000;
+    const docs: RemoteDocument[] = [];
+    let bookmark: string | undefined;
+
+    for (;;) {
+      const body: Record<string, unknown> = { selector, limit: pageLimit };
+      if (bookmark) {
+        body["bookmark"] = bookmark;
+      }
+      const result = await this.request<{ docs: RemoteDocument[]; bookmark?: string }>("/_find", {
+        method: "POST",
+        body: JSON.stringify(body)
+      });
+      for (const doc of result.docs) {
+        docs.push(...this.normalizeRemoteDocument(doc));
+      }
+      // 返却件数がページ上限未満なら最終ページ。bookmark が無ければ打ち切り。
+      if (result.docs.length < pageLimit || !result.bookmark) {
+        break;
+      }
+      bookmark = result.bookmark;
+    }
+
+    return docs;
   }
 
   async getDocumentsByIds(ids: string[]): Promise<RemoteDocument[]> {
@@ -177,6 +234,32 @@ export class CouchDbClient {
   async getLatestSequence(): Promise<string> {
     const result = await this.request<{ last_seq: string }>("/_changes?limit=0");
     return result.last_seq;
+  }
+
+  /**
+   * CouchDB の long-polling changes feed を使い、変更が来るまで待機する。
+   * タイムアウト内に変更がなければ空の results で返る。
+   * AbortSignal で呼び出し元からキャンセル可能。
+   */
+  async pollChanges(since: string | number, timeoutMs: number, signal?: AbortSignal): Promise<CouchDbChangesResult> {
+    const encodedSince = encodeURIComponent(String(since));
+    const heartbeatMs = Math.max(Math.floor(timeoutMs * 0.8), 5000);
+    const result = await this.request<{
+      last_seq: string;
+      results: Array<{ id: string; deleted?: boolean; changes?: Array<{ rev: string }> }>;
+    }>(`/_changes?feed=longpoll&since=${encodedSince}&timeout=${timeoutMs}&heartbeat=${heartbeatMs}`, { signal });
+
+    const changes = result.results.flatMap((row) => {
+      if (row.id.startsWith("_")) return [];
+      if (!row.deleted && isLikelyLeafId(row.id)) return [];
+      return [{
+        id: row.id,
+        deleted: row.deleted ?? false,
+        rev: row.changes?.[0]?.rev,
+      } satisfies CouchDbChangeEntry];
+    });
+
+    return { lastSeq: result.last_seq, changes };
   }
 
   async upsertDocument(document: RemoteDocument, expectedRev?: string): Promise<CouchDbWriteResponse> {
